@@ -350,6 +350,17 @@ impl DileVtCapture {
                 "[+] DILE_VT hardware video plane ready: {}x{}, stride: {}, format: {:?}, ring buffers: {}, planes: {}",
                 prop.width, prop.height, prop.stride, prop.pixel_format, cap.num_vfbs, cap.num_planes
             );
+            if !matches!(
+                prop.pixel_format,
+                DileVtPixelFormat::Yuv420SemiPlanar
+                    | DileVtPixelFormat::Yuv422SemiPlanar
+                    | DileVtPixelFormat::Rgb
+            ) {
+                warn!(
+                    "DILE_VT pixel format {:?} is not supported; only luma (grayscale) will be sampled.",
+                    prop.pixel_format
+                );
+            }
 
             // 7. Open /dev/mem with O_SYNC to map physical DMA video buffers
             let mem_file = OpenOptions::new()
@@ -363,7 +374,10 @@ impl DileVtCapture {
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let page_mask = (page_size - 1) as libc::off_t;
 
-            let capture_width = if prop.width > 0 {
+            let capture_width = if prop.pixel_format == DileVtPixelFormat::Rgb && prop.stride >= 3 {
+                // vfbprop.width reports the stride in bytes for packed RGB on some firmware.
+                prop.stride / 3
+            } else if prop.width > 0 {
                 prop.width
             } else {
                 target_width
@@ -388,10 +402,12 @@ impl DileVtCapture {
                     let phys_base = phys_addr & !page_mask;
                     let page_offset = (phys_addr & page_mask) as usize;
 
-                    let plane_len = if plane_idx == 0 {
+                    let plane_len = if plane_idx == 0
+                        || prop.pixel_format == DileVtPixelFormat::Yuv422SemiPlanar
+                    {
                         (stride * capture_height) as usize
                     } else {
-                        (stride * (capture_height / 2)) as usize
+                        (stride * capture_height.div_ceil(2)) as usize
                     };
                     let map_len = page_offset + plane_len;
 
@@ -453,36 +469,70 @@ impl DileVtCapture {
             })
         }
     }
+}
 
-    #[inline(always)]
-    unsafe fn convert_nv12_to_rgb(&mut self, y_plane: *const u8, uv_plane: *const u8) {
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let stride = self.stride as usize;
+/// Converts semi-planar YUV (Y plane + interleaved UV plane) to RGBA, BT.601 limited range.
+/// `chroma_subsampled_vertically` is true for 4:2:0 (NV12) and false for 4:2:2 (NV16).
+///
+/// # Safety
+/// `y_plane` must cover `stride * height` bytes and `uv_plane` `stride * chroma_rows` bytes.
+pub unsafe fn convert_semi_planar_to_rgba(
+    width: usize,
+    height: usize,
+    stride: usize,
+    y_plane: *const u8,
+    uv_plane: *const u8,
+    chroma_subsampled_vertically: bool,
+    out: &mut [u8],
+) {
+    for y in 0..height {
+        let y_row = y * stride;
+        let uv_row = if chroma_subsampled_vertically {
+            (y / 2) * stride
+        } else {
+            y * stride
+        };
+        let out_row = y * width * 4;
 
-        for y in 0..height {
-            let y_row = y * stride;
-            let uv_row = (y / 2) * stride;
-            let out_row = y * width * 4;
+        for x in 0..width {
+            let y_val = *y_plane.add(y_row + x) as i32;
+            let uv_offset = uv_row + (x / 2) * 2;
+            let u_val = *uv_plane.add(uv_offset) as i32 - 128;
+            let v_val = *uv_plane.add(uv_offset + 1) as i32 - 128;
 
-            for x in 0..width {
-                let y_val = *y_plane.add(y_row + x) as i32;
-                let uv_offset = uv_row + (x / 2) * 2;
-                let u_val = *uv_plane.add(uv_offset) as i32 - 128;
-                let v_val = *uv_plane.add(uv_offset + 1) as i32 - 128;
+            let c = (y_val - 16).max(0);
+            let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 516 * u_val + 128) >> 8).clamp(0, 255) as u8;
 
-                // Fixed-point BT.709 video range conversion
-                let c = (y_val - 16).max(0);
-                let r = ((298 * c + 409 * v_val + 128) >> 8).clamp(0, 255) as u8;
-                let g = ((298 * c - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u8;
-                let b = ((298 * c + 516 * u_val + 128) >> 8).clamp(0, 255) as u8;
+            let out_idx = out_row + x * 4;
+            out[out_idx] = r;
+            out[out_idx + 1] = g;
+            out[out_idx + 2] = b;
+            out[out_idx + 3] = 255;
+        }
+    }
+}
 
-                let out_idx = out_row + x * 4;
-                self.rgb_buffer[out_idx] = r;
-                self.rgb_buffer[out_idx + 1] = g;
-                self.rgb_buffer[out_idx + 2] = b;
-                self.rgb_buffer[out_idx + 3] = 255;
-            }
+/// Expands packed 24-bit RGB rows into RGBA.
+///
+/// # Safety
+/// `src` must cover `stride * height` bytes with `stride >= width * 3`.
+pub unsafe fn convert_rgb24_to_rgba(
+    width: usize,
+    height: usize,
+    stride: usize,
+    src: *const u8,
+    out: &mut [u8],
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let s = src.add(y * stride + x * 3);
+            let o = (y * width + x) * 4;
+            out[o] = *s;
+            out[o + 1] = *s.add(1);
+            out[o + 2] = *s.add(2);
+            out[o + 3] = 255;
         }
     }
 }
@@ -507,18 +557,32 @@ impl ScreenCapture for DileVtCapture {
             let vfb_idx = (current_idx as usize) % self.num_vfbs;
             let planes = &self.mapped_buffers[vfb_idx];
 
+            let (width, height, stride) = (
+                self.width as usize,
+                self.height as usize,
+                self.stride as usize,
+            );
             match self.pixel_format {
-                DileVtPixelFormat::Yuv420SemiPlanar => {
-                    let y_ptr = planes[0].data_ptr;
-                    let uv_ptr = planes[1].data_ptr;
-                    self.convert_nv12_to_rgb(y_ptr, uv_ptr);
+                DileVtPixelFormat::Yuv420SemiPlanar | DileVtPixelFormat::Yuv422SemiPlanar
+                    if planes.len() >= 2 =>
+                {
+                    convert_semi_planar_to_rgba(
+                        width,
+                        height,
+                        stride,
+                        planes[0].data_ptr,
+                        planes[1].data_ptr,
+                        self.pixel_format == DileVtPixelFormat::Yuv420SemiPlanar,
+                        &mut self.rgb_buffer,
+                    );
                 }
                 DileVtPixelFormat::Rgb => {
-                    let src_ptr = planes[0].data_ptr;
-                    std::ptr::copy_nonoverlapping(
-                        src_ptr,
-                        self.rgb_buffer.as_mut_ptr(),
-                        self.rgb_buffer.len(),
+                    convert_rgb24_to_rgba(
+                        width,
+                        height,
+                        stride,
+                        planes[0].data_ptr,
+                        &mut self.rgb_buffer,
                     );
                 }
                 _ => {
@@ -640,6 +704,32 @@ fn parse_frame_rate(value: &serde_json::Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semi_planar_422_uses_one_chroma_row_per_luma_row() {
+        // 2x2 frame, stride 2. Row 0 chroma is neutral, row 1 chroma is strongly red (V high).
+        let y = [128u8; 4];
+        let uv = [128u8, 128, 128, 255];
+        let mut out = [0u8; 16];
+        unsafe { convert_semi_planar_to_rgba(2, 2, 2, y.as_ptr(), uv.as_ptr(), false, &mut out) };
+        assert_eq!(out[0], out[1], "row 0 must stay neutral grey");
+        assert!(
+            out[8] > out[9] + 100,
+            "row 1 must pick up its own red chroma row"
+        );
+
+        // The same buffers read as 4:2:0 reuse chroma row 0 for both luma rows.
+        unsafe { convert_semi_planar_to_rgba(2, 2, 2, y.as_ptr(), uv.as_ptr(), true, &mut out) };
+        assert_eq!(out[8], out[9]);
+    }
+
+    #[test]
+    fn rgb24_expands_to_rgba_and_skips_row_padding() {
+        let src = [10u8, 20, 30, 0xEE, 40, 50, 60, 0xEE];
+        let mut out = [0u8; 8];
+        unsafe { convert_rgb24_to_rgba(1, 2, 4, src.as_ptr(), &mut out) };
+        assert_eq!(out, [10, 20, 30, 255, 40, 50, 60, 255]);
+    }
 
     #[test]
     fn reads_nested_fractional_video_frame_rate() {

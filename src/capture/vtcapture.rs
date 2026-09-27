@@ -88,6 +88,22 @@ pub struct VtCapture {
 // Raw pointers in VtCapture are actor/thread safe when owned by ScreenCapture
 unsafe impl Send for VtCapture {}
 
+/// Creates and releases a driver instance without starting capture (used by the child-process probe).
+pub fn probe_driver() -> Result<()> {
+    let lib = unsafe { Library::new(LIBVTCAPTURE_PATH) }
+        .map_err(|e| anyhow!("Failed to dlopen {}: {}", LIBVTCAPTURE_PATH, e))?;
+    unsafe {
+        let fn_create: Symbol<FnVtCaptureCreate> = lib.get(b"vtCapture_create\0")?;
+        let fn_release: Symbol<FnVtCaptureRelease> = lib.get(b"vtCapture_release\0")?;
+        let driver = fn_create();
+        if driver.is_null() {
+            return Err(anyhow!("vtCapture_create returned NULL"));
+        }
+        fn_release(driver);
+    }
+    Ok(())
+}
+
 impl VtCapture {
     /// Attempts to dynamically load `/usr/lib/libvtcapture.so.1` and initialize the capture pipeline.
     pub fn try_new(target_width: u32, target_height: u32) -> Result<Self> {

@@ -2,6 +2,7 @@ mod capture;
 mod color;
 mod compat;
 mod config;
+mod govee;
 mod hue;
 mod nanoleaf;
 mod runtime;
@@ -19,9 +20,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use capture::{create_capture, detect_source_fps, VtCapture};
+use capture::protected::secure_playback_active;
+use capture::{
+    create_capture, detect_source_fps, try_hardware_capture, MockCapture, ScreenCapture,
+};
 use color::{RgbColor, ZoneSampler};
-use config::{Config, ConfigError, NanoleafAlignment};
+use config::{Config, ConfigError, GoveeConfig, NanoleafAlignment};
+use govee::{GoveeBandSampler, GoveeRazerStreamer};
 use hue::{sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder};
 use nanoleaf::{NanoleafPerimeterSampler, NanoleafUdpStreamer};
 use runtime::{PendingCommands, PipelineState, RetryState};
@@ -29,7 +34,7 @@ use web::{start_web_server, CalibrationPattern, LiveSettings, SharedState};
 
 #[derive(Parser)]
 #[command(name = "lg-hue-sync")]
-#[command(about = "High-performance native screen capture and ambient lighting synchronizer for LG webOS (Hue & Nanoleaf 4D)", long_about = None)]
+#[command(about = "High-performance native screen capture and ambient lighting synchronizer for LG webOS (Hue, Nanoleaf 4D & Govee)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -49,6 +54,11 @@ enum Commands {
     },
     /// Stream a test color pattern to Nanoleaf 4D lightstrip on port 60222
     TestNanoleaf {
+        #[arg(short, long, default_value = "config.json")]
+        config: PathBuf,
+    },
+    /// Stream a test color pattern to the Govee strip (LAN API razer mode, UDP 4003)
+    TestGovee {
         #[arg(short, long, default_value = "config.json")]
         config: PathBuf,
     },
@@ -87,12 +97,18 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
+    // Internal: libvtcapture probe child (see capture::vtcapture_usable).
+    if std::env::args().nth(1).as_deref() == Some(capture::VTCAPTURE_PROBE_COMMAND) {
+        std::process::exit(capture::run_vtcapture_probe());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Run { config } => run_daemon(config).await,
         Commands::TestPattern { config } => run_test_pattern(config).await,
         Commands::TestNanoleaf { config } => run_test_nanoleaf(config).await,
+        Commands::TestGovee { config } => run_test_govee(config).await,
         Commands::TestCapture { config } => run_test_capture(config).await,
         Commands::Pair { bridge, output } => run_pair(bridge, output).await,
         Commands::SyncHue { config, area } => run_sync_hue(config, area).await,
@@ -242,6 +258,46 @@ fn colors_changed(previous: &[RgbColor], current: &[RgbColor]) -> bool {
             .any(|(left, right)| left.delta(*right) >= 0.005)
 }
 
+/// Opens hardware capture unless the foreground video is on the secure path, where the webOS VT
+/// driver refuses capture by design; then MockCapture stands in until playback ends.
+fn open_capture(config: &Config, protected_playback: bool) -> Box<dyn ScreenCapture> {
+    if protected_playback {
+        info!("Protected (DRM) playback in the foreground: capture paused until it ends.");
+        return Box::new(MockCapture::new(
+            config.capture_width,
+            config.capture_height,
+        ));
+    }
+    create_capture(
+        config.capture_backend,
+        config.capture_width,
+        config.capture_height,
+    )
+}
+
+fn govee_config(config: &Config) -> Option<&GoveeConfig> {
+    config
+        .govee
+        .as_ref()
+        .filter(|govee| govee.enabled && !govee.ip.is_empty())
+}
+
+fn connect_govee(govee: &GoveeConfig) -> Option<GoveeRazerStreamer> {
+    match GoveeRazerStreamer::new(&govee.ip) {
+        Ok(streamer) => {
+            info!(
+                "[+] Govee razer streaming ready: {} segments -> {}:4003",
+                govee.segments, govee.ip
+            );
+            Some(streamer)
+        }
+        Err(error) => {
+            warn!("Govee streaming unavailable: {error}");
+            None
+        }
+    }
+}
+
 async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut config = match Config::load(&config_path) {
         Ok(config) => config,
@@ -259,6 +315,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         .as_ref()
         .map(|n| n.enabled && !n.ip.is_empty() && !n.auth_token.is_empty())
         .unwrap_or(false);
+    let govee_active = govee_config(&config).is_some();
 
     let mut observed_tv_power = if config.auto_tv_power {
         match tv_power::is_active().await {
@@ -302,6 +359,9 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    if let Some(govee) = govee_config(&config) {
+        info!("Govee output: ACTIVE @ {}", govee.ip);
+    }
     info!(
         "Loaded configuration (Hue: {}, Nanoleaf: {})",
         if hue_active {
@@ -356,6 +416,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     // 1. Initialize Philips Hue DTLS client if active
     let mut hue_sync_enabled = config.hue_sync_enabled;
     let mut nanoleaf_sync_enabled = config.nanoleaf_sync_enabled;
+    let govee_sync_enabled = config.govee_sync_enabled;
     let mut hue_dtls = if hue_active && hue_sync_enabled && pipeline_should_run {
         let client = reconnect_hue(&config)?;
         Some(client)
@@ -425,8 +486,32 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         sampler.set_max_color_step(config.max_color_step);
     }
 
-    // 3. Initialize capture
-    let mut capture = create_capture(config.capture_width, config.capture_height);
+    // 3. Initialize Govee razer streamer if active
+    let mut govee_sampler = govee_config(&config).map(|govee| {
+        let mut sampler = GoveeBandSampler::new(
+            govee,
+            config.hdr_tone_mapping,
+            config.saturation_boost,
+            config.noise_gate_threshold,
+            config.brightness_multiplier * config.govee_output_brightness,
+        );
+        let processor = sampler.processor_mut();
+        processor.set_temporal_response(config.rise_smoothing_factor, config.fall_smoothing_factor);
+        processor.set_strict_blackout(config.strict_blackout);
+        processor.set_peak_weight(config.peak_weight);
+        processor.set_gamma(config.gamma);
+        processor.set_max_color_step(config.max_color_step);
+        sampler
+    });
+    let mut govee_streamer = if govee_sync_enabled && pipeline_should_run {
+        govee_config(&config).and_then(connect_govee)
+    } else {
+        None
+    };
+
+    // 4. Initialize capture
+    let mut protected_playback = secure_playback_active() == Some(true);
+    let mut capture = open_capture(&config, protected_playback);
 
     // Determine target framerate (supports auto-matching source refresh rate 23.976..60.0 Hz)
     let detected_fps = if config.fps == 0 {
@@ -554,11 +639,12 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut light_update_window = tokio::time::Instant::now();
     let mut last_watchdog = tokio::time::Instant::now();
     let mut last_status_check = tokio::time::Instant::now();
-    let mut last_hw_probe = tokio::time::Instant::now();
     let mut last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
     let mut last_tv_power_warning = tokio::time::Instant::now() - Duration::from_secs(30);
     let mut hue_retry = RetryState::new();
     let mut nanoleaf_retry = RetryState::new();
+    let mut capture_retry = RetryState::new();
+    let mut last_protected_poll = tokio::time::Instant::now();
     let mut nanoleaf_only_frame_count = 0u64;
     let mut nanoleaf_only_global = RgbColor::new(0, 0, 0);
     let mut pending_commands = PendingCommands {
@@ -662,6 +748,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 let black = vec![RgbColor::new(0, 0, 0); ns.panel_count()];
                 let _ = ns.send_frame(&black, 0);
             }
+            // Hand the Govee strip back to its own scene while paused
+            if let Some(ref mut gs) = govee_streamer {
+                let _ = gs.set_enabled(false);
+            }
 
             while running.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -745,6 +835,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
                     shared_state.is_syncing.store(true, Ordering::SeqCst);
                     pipeline_state = PipelineState::Running;
+
+                    if govee_active && govee_sync_enabled && govee_streamer.is_none() {
+                        govee_streamer = govee_config(&config).and_then(connect_govee);
+                    }
 
                     if nanoleaf_active {
                         if let Some(ref n_cfg) = config.nanoleaf {
@@ -883,6 +977,23 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ns.set_max_color_step(live_st.max_color_step);
                 ns.set_alignment(live_st.nanoleaf_alignment);
             }
+            if let Some(ref mut gs) = govee_sampler {
+                gs.set_brightness_multiplier(
+                    live_st.brightness_multiplier * config.govee_output_brightness,
+                );
+                let processor = gs.processor_mut();
+                processor.set_temporal_response(
+                    live_st.rise_smoothing_factor,
+                    live_st.fall_smoothing_factor,
+                );
+                processor.set_strict_blackout(live_st.strict_blackout);
+                processor.set_hdr_tone_mapping(live_st.hdr_tone_mapping);
+                processor.set_saturation_boost(live_st.saturation_boost);
+                processor.set_peak_weight(live_st.peak_weight);
+                processor.set_gamma(live_st.gamma);
+                processor.set_noise_gate_threshold(live_st.noise_gate_threshold);
+                processor.set_max_color_step(live_st.max_color_step);
+            }
             info!(
                 "Applied live settings: Hue={:.1}x, Nanoleaf={:.1}x, saturation={:.1}x, smoothing={:.2}, xy_mode={}",
                 current_hue_brightness,
@@ -1007,7 +1118,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             info!("Pipeline restart requested via Web UI. Re-initializing capture...");
             drop(capture);
             tokio::time::sleep(Duration::from_millis(500)).await;
-            capture = create_capture(config.capture_width, config.capture_height);
+            protected_playback = secure_playback_active() == Some(true);
+            capture = open_capture(&config, protected_playback);
             shared_state
                 .capture_hardware
                 .store(capture.is_real_hardware(), Ordering::Relaxed);
@@ -1029,27 +1141,62 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
         }
 
-        // If currently on fallback MockCapture, rapidly probe if hardware VtCapture has become available
-        // (e.g. if the TV was on the home screen at boot or during input/format switch)
-        if !capture.is_real_hardware() && last_hw_probe.elapsed() >= Duration::from_millis(500) {
-            last_hw_probe = tokio::time::Instant::now();
-            match VtCapture::try_new(config.capture_width, config.capture_height) {
-                Ok(hw_capture) => {
-                    info!("[+] Successfully upgraded from MockCapture to hardware VtCapture!");
-                    capture = Box::new(hw_capture);
-                    shared_state.capture_hardware.store(true, Ordering::Relaxed);
+        // While on MockCapture, retry hardware capture with bounded backoff. Protected playback is
+        // polled first: the VT driver refuses the secure video path, so probing it only spams the
+        // kernel log. Retry resumes as soon as that playback ends.
+        if !capture.is_real_hardware() {
+            if last_protected_poll.elapsed() >= Duration::from_secs(2) {
+                last_protected_poll = tokio::time::Instant::now();
+                let now_protected = secure_playback_active() == Some(true);
+                if now_protected != protected_playback {
+                    protected_playback = now_protected;
+                    if protected_playback {
+                        info!("Protected (DRM) playback started: capture paused, lights released.");
+                    } else {
+                        info!("Protected playback ended: resuming hardware capture.");
+                        capture_retry.success();
+                    }
                 }
-                Err(_) => {
-                    // Hardware capture still settling
+            }
+            if !protected_playback && capture_retry.ready() {
+                match try_hardware_capture(
+                    config.capture_backend,
+                    config.capture_width,
+                    config.capture_height,
+                ) {
+                    Ok(hw_capture) => {
+                        info!("[+] Hardware capture available again.");
+                        capture = hw_capture;
+                        capture_retry.success();
+                        shared_state.capture_hardware.store(true, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        let delay = capture_retry.failure();
+                        tracing::debug!(
+                            "Hardware capture unavailable ({error}); retrying in {:.1}s",
+                            delay.as_secs_f32()
+                        );
+                    }
                 }
             }
         }
 
+        // Without real frames (protected playback, no source) the Govee strip goes back to its
+        // own scene instead of being driven black.
+        if !capture.is_real_hardware() {
+            if let Some(ref mut gs) = govee_streamer {
+                let _ = gs.set_enabled(false);
+            }
+        }
+
+        let hardware_frames = capture.is_real_hardware();
         match capture.acquire_frame() {
             Ok(frame) => {
                 let mut is_scene_cut = false;
 
-                if !hue_sync_enabled && nanoleaf_sync_enabled {
+                let govee_streaming =
+                    govee_active && govee_sync_enabled && govee_streamer.is_some();
+                if !hue_sync_enabled && (nanoleaf_sync_enabled || govee_streaming) {
                     nanoleaf_only_frame_count += 1;
                     let global =
                         frame_average(frame.data, frame.width, frame.height, frame.is_bgra);
@@ -1060,13 +1207,17 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         && (nanoleaf_only_frame_count == 1
                             || nanoleaf_only_frame_count.is_multiple_of(15))
                     {
+                        let rect = ZoneSampler::detect_active_rect(
+                            frame.data,
+                            frame.width,
+                            frame.height,
+                            frame.is_bgra,
+                        );
                         if let Some(ref mut sampler) = nanoleaf_sampler {
-                            sampler.set_active_rect(ZoneSampler::detect_active_rect(
-                                frame.data,
-                                frame.width,
-                                frame.height,
-                                frame.is_bgra,
-                            ));
+                            sampler.set_active_rect(rect);
+                        }
+                        if let Some(ref mut sampler) = govee_sampler {
+                            sampler.set_active_rect(rect);
                         }
                     }
                 }
@@ -1087,6 +1238,9 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         let active_rect = sampler.active_rect();
                         if let Some(ref mut nl_s) = nanoleaf_sampler {
                             nl_s.set_active_rect(active_rect);
+                        }
+                        if let Some(ref mut g_s) = govee_sampler {
+                            g_s.set_active_rect(active_rect);
                         }
 
                         let calibration = calibration_pattern(&shared_state);
@@ -1269,6 +1423,27 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         }
                     }
                 }
+
+                // 3. Process Govee RGBIC strip (razer segment mode)
+                if govee_streaming && hardware_frames {
+                    if let (Some(ref mut g_sampler), Some(ref mut g_streamer)) =
+                        (&mut govee_sampler, &mut govee_streamer)
+                    {
+                        let colors = g_sampler.sample_frame(
+                            frame.data,
+                            frame.width,
+                            frame.height,
+                            frame.is_bgra,
+                            is_scene_cut,
+                        );
+                        let colors = calibration_pattern(&shared_state)
+                            .map(|pattern| calibration_perimeter_colors(pattern, colors.len()))
+                            .unwrap_or(colors);
+                        if g_streamer.send_frame(&colors).is_ok() {
+                            emitted_light_update = true;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -1304,12 +1479,16 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     }
                 }
 
-                // Re-initialize capture driver
-                capture = create_capture(config.capture_width, config.capture_height);
+                // Re-initialize capture driver (skipped while protected playback is in front)
+                protected_playback = secure_playback_active() == Some(true);
+                last_protected_poll = tokio::time::Instant::now();
+                capture = open_capture(&config, protected_playback);
+                if !capture.is_real_hardware() {
+                    capture_retry.failure();
+                }
                 shared_state
                     .capture_hardware
                     .store(capture.is_real_hardware(), Ordering::Relaxed);
-                last_hw_probe = tokio::time::Instant::now();
             }
         }
 
@@ -1420,9 +1599,56 @@ async fn run_test_nanoleaf(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+async fn run_test_govee(config_path: PathBuf) -> Result<()> {
+    let config = Config::load(&config_path)?;
+    let govee = govee_config(&config)
+        .ok_or_else(|| anyhow!("No enabled Govee configuration found in {:?}", config_path))?;
+    let mut streamer = GoveeRazerStreamer::new(&govee.ip)?;
+    let segments = usize::from(govee.segments.max(1));
+    info!(
+        "Streaming rainbow chase to Govee {} for 10 seconds...",
+        govee.ip
+    );
+
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < 10 {
+        let hue_offset = (start.elapsed().as_secs_f32() * 90.0) % 360.0;
+        let colors: Vec<RgbColor> = (0..segments)
+            .map(|i| {
+                let hue = (hue_offset + (i as f32 / segments as f32) * 360.0) % 360.0;
+                let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+                RgbColor::new(r, g, b)
+            })
+            .collect();
+        streamer.send_frame(&colors)?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    streamer.set_enabled(false)?;
+    info!("[+] Govee test pattern completed; strip returned to its previous scene.");
+    Ok(())
+}
+
 async fn run_test_capture(config_path: PathBuf) -> Result<()> {
     let config = Config::load(&config_path)?;
-    let mut capture = create_capture(config.capture_width, config.capture_height);
+    match secure_playback_active() {
+        Some(true) => warn!(
+            "Protected (DRM) playback is in the foreground: the webOS VT driver refuses capture \
+             of the secure video path. Switch to an HDMI input or unprotected content to test."
+        ),
+        Some(false) => info!("Foreground playback is not protected."),
+        None => info!("Protected-playback state unavailable (not on a webOS TV?)."),
+    }
+    let mut capture = create_capture(
+        config.capture_backend,
+        config.capture_width,
+        config.capture_height,
+    );
+    info!(
+        "Capture backend preference: {:?}; hardware: {}",
+        config.capture_backend,
+        capture.is_real_hardware()
+    );
     let mut sampler = ZoneSampler::new(
         config.zones.clone(),
         0.35,

@@ -135,6 +135,48 @@ fn default_nanoleaf_segments() -> u16 {
     30
 }
 
+/// Govee RGBIC strip driven through the LAN API "razer" (DreamView) segment mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoveeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub ip: String,
+    /// Number of colour segments sent per packet (the strip interpolates between them).
+    #[serde(default = "default_govee_segments")]
+    pub segments: u8,
+    /// Flip left/right when the strip is mounted running right-to-left.
+    #[serde(default)]
+    pub reverse: bool,
+    /// Normalised screen band that drives the strip, measured from the top edge
+    /// (0.0 = top, 1.0 = bottom). The defaults suit a strip above the TV.
+    #[serde(default = "default_govee_band_start")]
+    pub band_start: f32,
+    #[serde(default = "default_govee_band_end")]
+    pub band_end: f32,
+}
+
+fn default_govee_segments() -> u8 {
+    15
+}
+
+fn default_govee_band_start() -> f32 {
+    0.0
+}
+
+fn default_govee_band_end() -> f32 {
+    0.45
+}
+
+/// Which webOS capture API to use. `Auto` tries libvtcapture, then libdile_vt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureBackend {
+    #[default]
+    Auto,
+    Vtcapture,
+    DileVt,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Automatically pause/resume outputs with the TV's active/standby state.
@@ -162,6 +204,14 @@ pub struct Config {
     /// Runtime preference: stop sending Nanoleaf UDP frames when off.
     #[serde(default = "default_true")]
     pub nanoleaf_sync_enabled: bool,
+    #[serde(default)]
+    pub govee: Option<GoveeConfig>,
+    /// Runtime preference: release the Govee strip (razer off) when off.
+    #[serde(default = "default_true")]
+    pub govee_sync_enabled: bool,
+    /// Independent final output trim for the Govee strip.
+    #[serde(default = "default_output_trim")]
+    pub govee_output_brightness: f32,
     #[serde(default = "default_fps")]
     pub fps: u32,
     #[serde(default = "default_brightness")]
@@ -206,6 +256,8 @@ pub struct Config {
     pub capture_width: u32,
     #[serde(default = "default_capture_height")]
     pub capture_height: u32,
+    #[serde(default)]
+    pub capture_backend: CaptureBackend,
 }
 
 fn default_capture_width() -> u32 {
@@ -323,6 +375,9 @@ impl Config {
             entertainment_configuration_id: None,
             nanoleaf: None,
             nanoleaf_sync_enabled: true,
+            govee: None,
+            govee_sync_enabled: true,
+            govee_output_brightness: default_output_trim(),
             fps: default_fps(),
             brightness_multiplier: default_brightness(),
             hue_output_brightness: default_output_trim(),
@@ -343,6 +398,7 @@ impl Config {
             zones: default_zones(),
             capture_width: default_capture_width(),
             capture_height: default_capture_height(),
+            capture_backend: CaptureBackend::Auto,
         }
     }
 
@@ -407,6 +463,27 @@ mod tests {
         let saved = serde_json::to_value(config).unwrap();
         assert!(saved.get("hue_light_trims").is_none());
         assert!(saved["zones"][0].get("output_trim").is_none());
+    }
+
+    #[test]
+    fn govee_and_capture_backend_default_when_absent() {
+        let config: Config = serde_json::from_str(
+            r#"{"bridge_ip":"","username":"","clientkey":"","entertainment_area_id":""}"#,
+        )
+        .unwrap();
+        assert!(config.govee.is_none());
+        assert!(config.govee_sync_enabled);
+        assert_eq!(config.capture_backend, CaptureBackend::Auto);
+
+        let config: Config = serde_json::from_str(
+            r#"{"bridge_ip":"","username":"","clientkey":"","entertainment_area_id":"","capture_backend":"dile_vt","govee":{"ip":"192.0.2.10"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.capture_backend, CaptureBackend::DileVt);
+        let govee = config.govee.unwrap();
+        assert!(govee.enabled);
+        assert_eq!(govee.segments, 15);
+        assert_eq!((govee.band_start, govee.band_end), (0.0, 0.45));
     }
 
     #[test]

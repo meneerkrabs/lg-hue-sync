@@ -5,13 +5,14 @@
 [![webOS](https://img.shields.io/badge/webOS-rooted%205%2F6-blue.svg)](https://www.webosbrew.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon captures the displayed image, derives spatial colours, and streams them to Philips Hue Entertainment and Nanoleaf 4D. A responsive LAN dashboard provides pairing, calibration, presets, and independent output controls.
+Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon captures the displayed image, derives spatial colours, and streams them to Philips Hue Entertainment, Nanoleaf 4D and Govee RGBIC strips (LAN API razer mode). A responsive LAN dashboard provides pairing, calibration, presets, and independent output controls.
 
 ## Features
 
 - Root-only webOS capture through dynamically loaded `libvtcapture`/`dile_vt` APIs.
 - Hue Entertainment API v2 over DTLS 1.2 PSK, including gradient member identity.
 - Nanoleaf 4D UDP streaming with 40-panel corner, direction, and offset alignment.
+- Govee RGBIC output over the LAN API razer/DreamView segment mode (UDP 4003); the strip returns to its own scene whenever sync pauses.
 - Independent Hue/Nanoleaf controls; TV sleep/wake following can be automatic or manual.
 - Letterbox-aware sampling, HDR compression, OLED black gating, smoothing, and bounded scene changes.
 - Responsive dashboard at `http://<tv-ip>:8088/` with system, dark, and light themes.
@@ -19,7 +20,8 @@ Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon capt
 ## Limits and safety
 
 - Root access is required. Rooting can void warranties or render a TV unusable; confirm model and firmware compatibility first.
-- DRM-protected native webOS apps may expose black capture surfaces. External HDMI playback is the reliable path for protected content.
+- DRM-protected native webOS apps play through the secure video path, and the webOS VT driver refuses to capture it by design. The daemon detects that state, stops retrying capture and releases the lights until playback ends; it does not try to capture protected content. External HDMI playback is the path for protected content.
+- `libvtcapture` registers on the Luna bus and aborts the process when the executable has no Luna role (install path + `scripts/provision_luna.sh`). `auto` probes it in a child process and falls back to `libdile_vt`; set `"capture_backend": "dile_vt"` to skip the probe.
 - Hue decides how physical gradient segments are grouped into Entertainment channels. This project streams the selected area's returned channels; it does not fabricate more.
 - LG private capture APIs and community root methods are unsupported by LG and may change with firmware.
 
@@ -77,6 +79,19 @@ cargo run -- run --config config.json
 Pairing and patterns affect physical devices. Use them only when the owner expects light output.
 
 ## Configuration
+
+webOS 5 (e.g. BX/CX, Realtek) is supported through `libdile_vt`, including its 4:2:2 frame format. A Govee-only setup needs no Hue pairing:
+
+```json
+{
+  "bridge_ip": "", "username": "", "clientkey": "", "entertainment_area_id": "",
+  "hue_enabled": false,
+  "capture_backend": "auto",
+  "govee": { "ip": "192.168.1.50", "segments": 15, "reverse": false, "band_start": 0.0, "band_end": 0.45 }
+}
+```
+
+Enable the strip's LAN control in the Govee Home app first; verify with `lg-hue-sync test-govee --config config.json`.
 
 Start from [config.example.json](config.example.json), or pair through the dashboard. Runtime configuration contains secrets and stays untracked. On the TV:
 
