@@ -1453,6 +1453,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 // Explicitly drop capture to close /dev/video60 and free hardware scaler
                 drop(capture);
 
+                // No frames while the pipeline settles: hand the Govee strip back to its scene.
+                if let Some(ref mut gs) = govee_streamer {
+                    let _ = gs.set_enabled(false);
+                }
+
                 // Clear/black out Nanoleaf during video transition
                 if let Some(ref mut ns) = nanoleaf_streamer {
                     let black = vec![RgbColor::new(0, 0, 0); ns.panel_count()];

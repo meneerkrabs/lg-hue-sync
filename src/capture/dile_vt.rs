@@ -375,8 +375,12 @@ impl DileVtCapture {
             let page_mask = (page_size - 1) as libc::off_t;
 
             let capture_width = if prop.pixel_format == DileVtPixelFormat::Rgb && prop.stride >= 3 {
-                // vfbprop.width reports the stride in bytes for packed RGB on some firmware.
-                prop.stride / 3
+                // Some firmware reports the stride in bytes as the width for packed RGB.
+                if prop.width > 0 && prop.width * 3 <= prop.stride {
+                    prop.width
+                } else {
+                    prop.stride / 3
+                }
             } else if prop.width > 0 {
                 prop.width
             } else {
@@ -391,6 +395,12 @@ impl DileVtCapture {
                 prop.stride
             } else {
                 capture_width
+            };
+            // Never read past a row: a reported width wider than the stride would overrun.
+            let capture_width = if prop.pixel_format == DileVtPixelFormat::Rgb {
+                capture_width.min(stride / 3)
+            } else {
+                capture_width.min(stride)
             };
 
             let mut mapped_buffers = Vec::with_capacity(cap.num_vfbs as usize);
@@ -475,7 +485,8 @@ impl DileVtCapture {
 /// `chroma_subsampled_vertically` is true for 4:2:0 (NV12) and false for 4:2:2 (NV16).
 ///
 /// # Safety
-/// `y_plane` must cover `stride * height` bytes and `uv_plane` `stride * chroma_rows` bytes.
+/// `y_plane` must cover `stride * height` bytes and `uv_plane` `stride * chroma_rows` bytes,
+/// with `2 <= stride` and `width <= stride`.
 pub unsafe fn convert_semi_planar_to_rgba(
     width: usize,
     height: usize,
@@ -496,7 +507,8 @@ pub unsafe fn convert_semi_planar_to_rgba(
 
         for x in 0..width {
             let y_val = *y_plane.add(y_row + x) as i32;
-            let uv_offset = uv_row + (x / 2) * 2;
+            // Clamp so an odd width cannot read one byte past the chroma row.
+            let uv_offset = uv_row + ((x / 2) * 2).min(stride.saturating_sub(2));
             let u_val = *uv_plane.add(uv_offset) as i32 - 128;
             let v_val = *uv_plane.add(uv_offset + 1) as i32 - 128;
 
@@ -721,6 +733,16 @@ mod tests {
         // The same buffers read as 4:2:0 reuse chroma row 0 for both luma rows.
         unsafe { convert_semi_planar_to_rgba(2, 2, 2, y.as_ptr(), uv.as_ptr(), true, &mut out) };
         assert_eq!(out[8], out[9]);
+    }
+
+    #[test]
+    fn odd_width_never_reads_past_the_chroma_row() {
+        // width 3 == stride 3: the last pixel must reuse chroma bytes 0..2, not byte 3.
+        let y = [128u8; 3];
+        let uv = [128u8, 128];
+        let mut out = [0u8; 12];
+        unsafe { convert_semi_planar_to_rgba(3, 1, 2, y.as_ptr(), uv.as_ptr(), true, &mut out) };
+        assert_eq!(&out[8..12], &out[0..4]);
     }
 
     #[test]

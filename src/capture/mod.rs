@@ -85,11 +85,15 @@ pub fn try_hardware_capture(
 ) -> Result<Box<dyn ScreenCapture>> {
     let mut errors = Vec::new();
 
+    // Probe even when libvtcapture is requested explicitly: without a Luna role it aborts the
+    // calling process, and an explicit preference must not turn that into a daemon crash.
     let try_vtcapture = match backend {
-        CaptureBackend::Vtcapture => true,
-        CaptureBackend::Auto => vtcapture_usable(),
+        CaptureBackend::Auto | CaptureBackend::Vtcapture => vtcapture_usable(),
         CaptureBackend::DileVt => false,
     };
+    if backend == CaptureBackend::Vtcapture && !try_vtcapture {
+        errors.push("vtcapture: unusable in this process (see probe warning)".to_string());
+    }
     if try_vtcapture {
         match VtCapture::try_new(width, height) {
             Ok(capture) => {

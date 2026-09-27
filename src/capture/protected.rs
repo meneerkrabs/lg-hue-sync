@@ -36,7 +36,15 @@ pub fn pipelines_indicate_secure(value: &Value) -> Option<bool> {
             if fields.get("returnValue") == Some(&Value::Bool(false)) {
                 return None;
             }
-            fields.values().find_map(Value::as_array)?
+            fields
+                .get("pipelines")
+                .and_then(Value::as_array)
+                .or_else(|| {
+                    fields
+                        .values()
+                        .filter_map(Value::as_array)
+                        .find(|items| items.first().is_some_and(|item| item.get("type").is_some()))
+                })?
         }
         _ => return None,
     };
@@ -92,6 +100,14 @@ mod tests {
         assert_eq!(pipelines_indicate_secure(&background), Some(false));
 
         assert_eq!(pipelines_indicate_secure(&json!([])), Some(false));
+    }
+
+    #[test]
+    fn wrapped_response_uses_the_pipeline_array() {
+        let response = json!({"returnValue": true, "subscribers": [],
+            "pipelines": [{"type": "media", "is_foreground": true,
+                "resource": [{"resource": "SVP_CPB", "index": 0}]}]});
+        assert_eq!(pipelines_indicate_secure(&response), Some(true));
     }
 
     #[test]
