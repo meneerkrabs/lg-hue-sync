@@ -1,5 +1,6 @@
 mod capture;
 mod color;
+mod compat;
 mod config;
 mod hue;
 mod nanoleaf;
